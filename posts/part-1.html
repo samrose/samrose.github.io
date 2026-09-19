@@ -1,0 +1,544 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>A local tier you can trust before you touch a GPU — Sam Rose</title>
+  <meta name="description" content="Part 1 of building an LLM inference platform: pinned tooling, a disposable kind cluster, and a mock engine that behaves like vLLM at the edges.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono&family=IBM+Plex+Sans:wght@400;500;600&family=Newsreader:opsz,wght@6..72,500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="../css/style.css">
+  <link rel="canonical" href="https://samrose.github.io/posts/part-1.html">
+</head>
+<body>
+<div class="page">
+
+  <header class="masthead">
+    <a class="name" href="../">Sam Rose</a>
+    <nav>
+      <a href="https://github.com/samrose">GitHub</a>
+      <a href="../about.html">About</a>
+    </nav>
+  </header>
+
+  <main>
+    <article>
+      <h1>A local tier you can trust before you touch a GPU</h1>
+      <p class="meta">September 2026. Part 1 of <a href="../#series">Building an LLM inference platform</a>.
+        Code: <a href="https://github.com/samrose/inference-platform/tree/post-1">tag <code>post-1</code></a>.</p>
+
+      <div class="series-note">
+        This series builds a self-hosted LLM serving platform on Kubernetes in
+        five parts, with the repo updated alongside each one. This part sets up
+        the foundation: the tooling, a local cluster, and a stand-in for the
+        inference engine.
+      </div>
+
+      <p>
+        Most guides to self-hosting an LLM end at <code>vllm serve</code>. That
+        gets you a process on port 8000 that answers a curl. It doesn't cover
+        how it gets deployed, how you know it is healthy, what happens to
+        in-flight requests during a rollout, or when to add a replica, and in
+        my experience that is most of the work.
+      </p>
+      <p>
+        This series builds that part. It's for people who already run
+        Kubernetes and are being asked to run inference. The code is at
+        <a href="https://github.com/samrose/inference-platform">github.com/samrose/inference-platform</a>, and each
+        post has a tag.
+      </p>
+
+      <h2>What this part claims</h2>
+      <p>
+        Most of an inference platform can be built and tested on a laptop
+        without a GPU. The chart, probes, metrics scraping, dashboards, alerts
+        and autoscaling only depend on how the engine behaves at its edges:
+        the port, what the health endpoint returns while weights load, and
+        what the metrics are called. This part sets up a local tier with a
+        stand-in engine that gets those right.
+      </p>
+
+      <h2>Pinned tooling</h2>
+      <p>
+        The repo needs about a dozen CLIs (kubectl, helm, kind, kubeconform,
+        OpenTofu, argocd, just, python, uv etc). I pin them with a Nix flake
+        and <code>flake.lock</code> is committed, so bumping a tool is a
+        reviewable diff
+        (<a href="https://github.com/samrose/inference-platform/blob/main/docs/adr/001-tooling-pins-via-nixflake.md">ADR 0001</a>).
+        Nix is only used for tooling here. Images are built with Docker and
+        charts with Helm. If you don't want Nix, install the versions below
+        some other way. Docker is the one thing the flake doesn't provide (I
+        use OrbStack on a Mac).
+      </p>
+
+      <pre><code>$ nix develop
+inference-platform dev shell
+  kubectl  v1.37.0
+  helm     v4.3.0
+  kind     v0.32.0
+  tofu     v1.12.6
+  argocd   refs/tags/v3.4.6</code></pre>
+
+      <p>
+        OpenTofu rather than Terraform because of the 2023 license change,
+        since this is a public repo
+        (<a href="https://github.com/samrose/inference-platform/blob/main/docs/adr/0002-opentofu-over-terraform.md">ADR 0002</a>).
+        Helm 4 and kind 0.32 because Helm 3 is end of life in 2027 and this
+        is a new repo.
+      </p>
+      <p>
+        kubectl is v1.37.0 and the cluster below is v1.36.1, because nixpkgs
+        unstable is ahead of the kind node image. kubectl supports one minor
+        version of skew so this is fine. The dev shell prints versions on
+        entry so that this kind of skew is visible.
+      </p>
+
+      <h2>A disposable cluster from one command</h2>
+      <p>
+        Every local operation is a recipe in the <code>justfile</code>
+        (<a href="https://just.systems">just</a> is a command runner).
+        <code>KUBECONFIG</code> is set to <code>local/kubeconfig</code> in
+        both the justfile and the dev shell, so nothing here can touch a
+        cluster in <code>~/.kube/config</code>.
+      </p>
+      <p>
+        <code>just up</code> creates a 3 node kind cluster (one control plane
+        and two workers, so that scheduling across nodes and drains can be
+        tested later), with the node image pinned by digest from the kind
+        v0.32.0 release notes. It also starts a <code>registry:2</code>
+        container on <code>127.0.0.1:5001</code>, connects it to the
+        <code>kind</code> Docker network, and configures containerd on each
+        node to pull <code>localhost:5001</code> images from it. I went with
+        a registry over <code>kind load docker-image</code> so that the local
+        workflow is build, push, reference by digest, which is the same as it
+        will be in the cloud
+        (<a href="https://github.com/samrose/inference-platform/blob/main/docs/adr/0003-local-registry-with-kind.md">ADR 0003</a>).
+      </p>
+      <p>
+        <code>just down</code> removes the cluster and keeps the registry,
+        <code>just nuke</code> removes both. <code>just up</code> takes about
+        a minute and is safe to run again:
+      </p>
+
+      <!-- CHECK: real output, but from a second run against an existing cluster. -->
+      <pre><code>$ just up
+cluster 'inference' already exists
+just _connect-registry
+configmap/local-registry-hosting unchanged
+kubectl wait --for=condition=Ready nodes --all --timeout=120s
+node/inference-control-plane condition met
+node/inference-worker condition met
+node/inference-worker2 condition met
+just status
+kubectl get nodes -o wide
+NAME                      STATUS   ROLES           AGE   VERSION   INTERNAL-IP     EXTERNAL-IP   OS-IMAGE                       KERNEL-VERSION                                CONTAINER-RUNTIME
+inference-control-plane   Ready    control-plane   28h   v1.36.1   192.168.148.2   &lt;none&gt;        Debian GNU/Linux 13 (trixie)   7.0.14-orbstack-00380-ga7e0a2dc9535 (arm64)   containerd://2.3.1
+inference-worker          Ready    &lt;none&gt;          28h   v1.36.1   192.168.148.4   &lt;none&gt;        Debian GNU/Linux 13 (trixie)   7.0.14-orbstack-00380-ga7e0a2dc9535 (arm64)   containerd://2.3.1
+inference-worker2         Ready    &lt;none&gt;          28h   v1.36.1   192.168.148.3   &lt;none&gt;        Debian GNU/Linux 13 (trixie)   7.0.14-orbstack-00380-ga7e0a2dc9535 (arm64)   containerd://2.3.1
+registry: localhost:5001 (running)</code></pre>
+
+      <details>
+        <summary>justfile</summary>
+        <pre><code># justfile — one entrypoint for every local operation.
+# Run `just` to list recipes.
+
+set shell := ["bash", "-euo", "pipefail", "-c"]
+set dotenv-load := true
+
+# ---- configuration (override with `just VAR=value recipe` or a .env file) ----
+cluster      := env_var_or_default("CLUSTER_NAME", "inference")
+reg_name     := env_var_or_default("REGISTRY_NAME", "kind-registry")
+reg_port     := env_var_or_default("REGISTRY_PORT", "5001")
+kind_config  := "local/kind-config.yml"
+kubeconfig   := "local/kubeconfig"
+chart        := "charts/inference-service"
+
+export KUBECONFIG := kubeconfig
+
+# default: show available recipes
+default:
+    @just --list --unsorted
+
+# ---- lifecycle ----------------------------------------------------------------
+
+# create the local registry, the kind cluster, and wire them together
+up: registry
+    @if kind get clusters | grep -qx "{{cluster}}"; then \
+        echo "cluster '{{cluster}}' already exists"; \
+    else \
+        kind create cluster --name "{{cluster}}" --config "{{kind_config}}" --kubeconfig "{{kubeconfig}}"; \
+    fi
+    just _connect-registry
+    kubectl wait --for=condition=Ready nodes --all --timeout=120s
+    just status
+
+# delete the cluster (registry is left running; `just nuke` removes both)
+down:
+    kind delete cluster --name "{{cluster}}"
+    rm -f "{{kubeconfig}}"
+
+# delete the cluster and the registry container
+nuke: down
+    docker rm -f "{{reg_name}}" &gt;/dev/null 2&gt;&amp;1 || true
+
+# start the local OCI registry if it isn't running
+registry:
+    @if [ "$(docker inspect -f '{{{{.State.Running}}' "{{reg_name}}" 2&gt;/dev/null)" != "true" ]; then \
+        docker run -d --restart=always -p "127.0.0.1:{{reg_port}}:5000" \
+            --network bridge --name "{{reg_name}}" registry:2; \
+    fi
+
+# tell containerd on every node about the registry and advertise it to tooling
+_connect-registry:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    reg_dir="/etc/containerd/certs.d/localhost:{{reg_port}}"
+    for node in $(kind get nodes --name "{{cluster}}"); do
+        docker exec "$node" mkdir -p "$reg_dir"
+        cat &lt;&lt;EOF | docker exec -i "$node" cp /dev/stdin "$reg_dir/hosts.toml"
+    [host."http://{{reg_name}}:5000"]
+    EOF
+    done
+    if [ "$(docker inspect -f='{{{{json .NetworkSettings.Networks.kind}}' "{{reg_name}}")" = "null" ]; then
+        docker network connect kind "{{reg_name}}"
+    fi
+    kubectl apply -f - &lt;&lt;EOF
+    apiVersion: v1
+    kind: ConfigMap
+    metadata:
+      name: local-registry-hosting
+      namespace: kube-public
+    data:
+      localRegistryHosting.v1: |
+        host: "localhost:{{reg_port}}"
+        help: "https://kind.sigs.k8s.io/docs/user/local-registry/"
+    EOF
+
+# cluster and registry health at a glance
+status:
+    kubectl get nodes -o wide
+    @echo "registry: localhost:{{reg_port}} ($(docker inspect -f '{{{{.State.Status}}' "{{reg_name}}" 2&gt;/dev/null || echo absent))"
+
+# ---- verification ---------------------------------------------------------------
+
+# prove the registry round-trips: push an image, run it in the cluster
+# (no --platform: Docker pulls the host arch, which is what the kind nodes run)
+smoke:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    img="localhost:{{reg_port}}/busybox:1.36"
+    docker pull busybox:1.36
+    docker tag busybox:1.36 "$img"
+    docker push "$img"
+    kubectl delete pod smoke --ignore-not-found &gt;/dev/null
+    kubectl run smoke --restart=Never --image="$img" -- echo "registry round-trip OK"
+    if ! kubectl wait pod/smoke --for=jsonpath='{.status.phase}'=Succeeded --timeout=60s; then
+        echo "--- smoke pod did not succeed; describe follows ---"
+        kubectl describe pod smoke | sed -n '/Events:/,$p'
+        kubectl delete pod smoke --ignore-not-found &gt;/dev/null
+        exit 1
+    fi
+    kubectl logs smoke
+    kubectl delete pod smoke &gt;/dev/null
+# ---- chart quality gates (filled in as step 1 progresses) -----------------------
+
+# static checks: lint, render, validate against the cluster's API schemas
+lint:
+    helm lint "{{chart}}"
+    helm template test "{{chart}}" | kubeconform -strict -summary -kubernetes-version "$(just _k8s-version)"
+
+# unit tests for the chart's templates
+test:
+    helm unittest "{{chart}}"
+
+# everything CI runs
+check: lint test
+
+# ---- helpers --------------------------------------------------------------------
+
+_k8s-version:
+    @kubectl version -o json | jq -r '.serverVersion.gitVersion' | sed 's/^v//'
+
+# ---- mock engine ------------------------------------------------------------------
+
+mock_image := "localhost:" + reg_port + "/mock-engine"
+
+# build the mock engine for the local arch and push it; records the digest
+mock-push:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    tag="{{mock_image}}:dev"
+    docker build -t "$tag" mock-engine
+    docker push "$tag"
+    digest=$(docker inspect --format '{{{{index .RepoDigests 0}}' "$tag" | cut -d@ -f2)
+    echo "$digest" &gt; local/mock-engine.digest
+    echo "pushed {{mock_image}}@$digest"
+
+# run the mock engine in the cluster by digest and exercise every endpoint
+mock-smoke:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    img="{{mock_image}}@$(cat local/mock-engine.digest)"
+    kubectl delete pod mock --ignore-not-found &gt;/dev/null
+    kubectl run mock --restart=Never --image="$img" --port=8000 \
+        --env STARTUP_DELAY_SECONDS=5 --env TTFT_MS=100 --env TPOT_MS=10
+    kubectl wait pod/mock --for=condition=Ready --timeout=60s
+    kubectl port-forward pod/mock 18000:8000 &gt;/dev/null 2&gt;&amp;1 &amp; pf=$!
+    trap 'kill $pf; kubectl delete pod mock &gt;/dev/null' EXIT
+    sleep 2
+    echo "--- health (expect 503 until startup delay elapses, then 200)"
+    for i in 1 2 3 4 5 6; do curl -s -o /dev/null -w "%{http_code}\n" localhost:18000/health; sleep 1; done
+    echo "--- streamed completion"
+    curl -sN localhost:18000/v1/chat/completions -H 'content-type: application/json' \
+        -d '{"model":"mock/mock-8b","stream":true,"max_tokens":5,"messages":[{"role":"user","content":"hi"}]}'
+    echo "--- admin: force queue depth"
+    curl -s -X POST localhost:18000/admin/state -H 'content-type: application/json' -d '{"waiting": 12, "kv_cache_usage": 0.85}'
+    echo; echo "--- metrics (vllm:* only)"
+    curl -s localhost:18000/metrics | grep '^vllm:' | grep -v '_bucket'</code></pre>
+      </details>
+
+      <details>
+        <summary>local/kind-config.yml</summary>
+        <pre><code># local/kind-config.yml — the local tier's cluster definition.
+# Pinning: the node image is pinned by digest; change it deliberately via an ADR.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: inference
+
+# Tell containerd on every node to read per-registry config from certs.d.
+# `just _connect-registry` writes /etc/containerd/certs.d/localhost:5001/hosts.toml
+# into each node so pulls from localhost:5001 resolve to the kind-registry container.
+containerdConfigPatches:
+  - |-
+    [plugins."io.containerd.grpc.v1.cri".registry]
+      config_path = "/etc/containerd/certs.d"
+
+nodes:
+  - role: control-plane
+    # Take the full image string for your chosen Kubernetes minor from the
+    # kind v0.32.0 release notes ("Images built for this release").
+    image: kindest/node:v1.36.1@sha256:3489c7674813ba5d8b1a9977baea8a6e553784dab7b84759d1014dbd78f7ebd5
+    # Label the control plane so a gateway/ingress can be pinned to it later.
+    kubeadmConfigPatches:
+      - |
+        kind: InitConfiguration
+        nodeRegistration:
+          kubeletExtraArgs:
+            node-labels: "ingress-ready=true"
+    # Host ports for the gateway (step 5). Unused until then; harmless now.
+    extraPortMappings:
+      - containerPort: 80
+        hostPort: 8080
+        protocol: TCP
+      - containerPort: 443
+        hostPort: 8443
+        protocol: TCP
+
+  - role: worker
+    image: kindest/node:v1.36.1@sha256:3489c7674813ba5d8b1a9977baea8a6e553784dab7b84759d1014dbd78f7ebd5
+
+  - role: worker
+    image: kindest/node:v1.36.1@sha256:3489c7674813ba5d8b1a9977baea8a6e553784dab7b84759d1014dbd78f7ebd5</code></pre>
+      </details>
+
+      <h2>The first bug</h2>
+      <p>
+        just uses <code>{{ }}</code> for its own variables, and so does
+        <code>docker inspect --format</code>. To pass a literal
+        <code>{{</code> through just you write <code>{{{{</code>, and the
+        closing <code>}}</code> is left alone. I escaped both sides:
+      </p>
+
+      <!-- CHECK: reproduced, behaves as described, but the broken version was never committed. Confirm. -->
+      <pre><code>if [ "$(docker inspect -f='{{{{json .NetworkSettings.Networks.kind}}}}' "{{reg_name}}")" = "null" ]; then
+    docker network connect kind "{{reg_name}}"
+fi</code></pre>
+
+      <p>
+        Docker receives <code>{{json .NetworkSettings.Networks.kind}}}}</code>
+        and treats the trailing <code>}}</code> as text, so for a container
+        that is not on the kind network it prints <code>null}}</code> instead
+        of <code>null</code>. The comparison fails and <code>docker network
+        connect</code> never runs. No error, exit code 0, and <code>just
+        up</code> looks healthy.
+      </p>
+      <!-- CHECK: the --platform detail is inferred from the comment above the smoke recipe. -->
+      <p>
+        <code>just smoke</code> then timed out. At that point it was a
+        <code>kubectl run --rm -i</code>, so a timeout was all I had to go on.
+        I'm on Apple Silicon, so I assumed an architecture mismatch, and there
+        was one: the smoke recipe pulled busybox with an explicit
+        <code>--platform</code>. I removed that and it still timed out.
+      </p>
+      <p>
+        The pod events had the answer. This is what they look like with the
+        registry disconnected from the kind network:
+      </p>
+
+      <pre><code>error: timed out waiting for the condition on pods/smoke-repro
+--- smoke pod did not succeed; describe follows ---
+Events:
+  Type     Reason     Age                From               Message
+  ----     ------     ----               ----               -------
+  Normal   Scheduled  45s                default-scheduler  Successfully assigned default/smoke-repro to inference-worker
+  Normal   BackOff    21s (x2 over 44s)  kubelet            Back-off pulling image "localhost:5001/busybox:repro-1789847397"
+  Warning  Failed     21s (x2 over 44s)  kubelet            Error: ImagePullBackOff
+  Normal   Pulling    10s (x3 over 45s)  kubelet            Pulling image "localhost:5001/busybox:repro-1789847397"
+  Warning  Failed     10s (x3 over 45s)  kubelet            Failed to pull image "localhost:5001/busybox:repro-1789847397": failed to pull and unpack image "localhost:5001/busybox:repro-1789847397": failed to resolve reference "localhost:5001/busybox:repro-1789847397": failed to do request: Head "http://kind-registry:5000/v2/busybox/manifests/repro-1789847397?ns=%5BREDACTED%5D": dial tcp: lookup kind-registry on 0.250.250.254:53: no such host
+  Warning  Failed     10s (x3 over 45s)  kubelet            Error: ErrImagePull</code></pre>
+
+      <p>The long line ends with:</p>
+
+      <pre class="wrap"><code>failed to do request: Head "http://kind-registry:5000/v2/busybox/manifests/repro-1789847397?ns=%5BREDACTED%5D": dial tcp: lookup kind-registry on 0.250.250.254:53: no such host</code></pre>
+
+      <p>
+        The node can't resolve the registry container by name, so it's the
+        Docker network and not architecture.
+      </p>
+      <p>
+        The fix was removing two characters. I also changed
+        <code>smoke</code> so it waits 60 seconds for the pod and prints the
+        events if it fails:
+      </p>
+
+      <pre><code>if ! kubectl wait pod/smoke --for=jsonpath='{.status.phase}'=Succeeded --timeout=60s; then
+    echo "--- smoke pod did not succeed; describe follows ---"
+    kubectl describe pod smoke | sed -n '/Events:/,$p'
+    kubectl delete pod smoke --ignore-not-found &gt;/dev/null
+    exit 1
+fi</code></pre>
+
+      <p>
+        A timeout told me something was wrong but not what. I want failing
+        checks in this repo to say why, and the same will apply to probes and
+        alerts later.
+      </p>
+
+      <h2>A mock engine</h2>
+      <p>
+        To build everything above the engine without a GPU, I need something
+        that behaves like vLLM at the points where the platform touches it:
+      </p>
+      <ul>
+        <li>OpenAI-compatible <code>/v1/chat/completions</code> with SSE
+          streaming, and <code>/v1/models</code>, on port 8000 with the same
+          paths as <code>vllm serve</code>, so the chart needs no
+          mock-specific branches</li>
+        <li><code>/health</code> returns 503 until the weights are loaded,
+          then 200. The mock takes a <code>STARTUP_DELAY_SECONDS</code></li>
+        <li><code>/metrics</code> with vLLM's metric names, labels and
+          histogram buckets, so PromQL written against the mock works
+          unchanged against the real engine</li>
+      </ul>
+      <p>
+        <code>mock-engine/</code> is a FastAPI app of about 190 lines that
+        does this
+        (<a href="https://github.com/samrose/inference-platform/blob/main/docs/adr/0004-mock-engine-scope.md">ADR 0004</a>).
+      </p>
+      <p>
+        I considered vLLM on CPU with a small model. It's slow to iterate on,
+        the metrics differ from the production build, and I can't control the
+        scaling signals. To test autoscaling on queue depth I need to set the
+        queue to 12 and see what happens. So the mock has <code>POST
+        /admin/state</code>, which sets queue depth and KV cache usage.
+        <code>num_requests_running</code> is real and follows requests in
+        flight.
+      </p>
+      <p>
+        One detail: <code>prometheus_client</code> adds a
+        <code>_created</code> series for every counter and histogram by
+        default, and vLLM's output doesn't have them. The Dockerfile sets
+        <code>PROMETHEUS_DISABLE_CREATED_SERIES=true</code> so that the mock's
+        metrics stay a subset of the real engine's, otherwise a dashboard
+        could end up depending on a series that isn't there in production.
+      </p>
+      <p>
+        <code>just mock-push</code> builds and pushes the image and records
+        its digest. <code>just mock-smoke</code> runs it in the cluster with a
+        5 second startup delay and hits each endpoint:
+      </p>
+
+      <pre><code>$ just mock-smoke
+pod/mock created
+pod/mock condition met
+--- health (expect 503 until startup delay elapses, then 200)
+503
+503
+503
+503
+200
+200
+--- streamed completion
+data: {"id": "chatcmpl-50193b636528", "object": "chat.completion.chunk", "created": 1789847337, "model": "mock/mock-8b", "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": null}]}
+
+data: {"id": "chatcmpl-50193b636528", "object": "chat.completion.chunk", "created": 1789847337, "model": "mock/mock-8b", "choices": [{"index": 0, "delta": {"content": "tok0 "}, "finish_reason": null}]}
+
+[tok1 through tok4 omitted]
+
+data: {"id": "chatcmpl-50193b636528", "object": "chat.completion.chunk", "created": 1789847337, "model": "mock/mock-8b", "choices": [{"index": 0, "delta": {}, "finish_reason": "length"}]}
+
+data: [DONE]
+
+--- admin: force queue depth
+{"ready":true,"waiting":12,"kv_cache_usage":0.85}
+--- metrics (vllm:* only)
+vllm:num_requests_running{engine="0",model_name="mock/mock-8b"} 0.0
+vllm:num_requests_waiting{engine="0",model_name="mock/mock-8b"} 12.0
+vllm:kv_cache_usage_perc{engine="0",model_name="mock/mock-8b"} 0.85
+vllm:gpu_cache_usage_perc{engine="0",model_name="mock/mock-8b"} 0.85
+vllm:time_to_first_token_seconds_count{engine="0",model_name="mock/mock-8b"} 1.0
+vllm:time_to_first_token_seconds_sum{engine="0",model_name="mock/mock-8b"} 0.10264143301174045
+vllm:time_per_output_token_seconds_count{engine="0",model_name="mock/mock-8b"} 5.0
+vllm:time_per_output_token_seconds_sum{engine="0",model_name="mock/mock-8b"} 0.05
+vllm:e2e_request_latency_seconds_count{engine="0",model_name="mock/mock-8b"} 1.0
+vllm:e2e_request_latency_seconds_sum{engine="0",model_name="mock/mock-8b"} 0.15268072301114444
+vllm:prompt_tokens_total{engine="0",model_name="mock/mock-8b"} 1.0
+vllm:generation_tokens_total{engine="0",model_name="mock/mock-8b"} 5.0
+vllm:request_success_total{engine="0",finished_reason="length",model_name="mock/mock-8b"} 1.0</code></pre>
+
+      <p>
+        Note <code>pod/mock condition met</code> followed by four 503s. The
+        pod is Ready before the engine is, because a pod from <code>kubectl
+        run</code> has no probes. With a real engine that gap is as long as
+        the weights take to load, and the pod would be receiving traffic
+        during it. The chart in part 2 fixes that.
+      </p>
+
+      <h2>What this tier can't tell you</h2>
+      <p>
+        The mock doesn't batch, doesn't model latency under load, and doesn't
+        tokenize. Time to first token and time per output token are
+        environment variables and a sleep. No performance conclusions can
+        come from it. Benchmarks come later, from the real engine on real
+        hardware.
+      </p>
+      <p>
+        The local tier is arm64 on my machine and cloud GPU nodes are amd64.
+        <code>just mock-push</code> builds for the host only, so the digest in
+        <code>local/mock-engine.digest</code> won't work in the cloud.
+        Multi-arch builds come with the cloud tier
+        (<a href="https://github.com/samrose/inference-platform/blob/main/docs/adr/0005-single-arch-local-build.md">ADR 0005</a>).
+      </p>
+
+      <h2>Next</h2>
+      <p>
+        Part 2 is the Helm chart: the values file an app team uses, startup
+        probe timing, chart tests that run without a cluster, and a rolling
+        update under load.
+      </p>
+    </article>
+
+    <nav class="prev-next">
+      <span></span>
+      <span>Part 2: The chart an app team actually uses (not yet published)</span>
+    </nav>
+  </main>
+
+  <footer>
+    <p>Written by hand. <a href="../feed.xml">RSS</a></p>
+  </footer>
+
+</div>
+</body>
+</html>

@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Sam Rose</title>
+  <meta name="description" content="Notes on infrastructure, databases, and running things in production.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono&family=IBM+Plex+Sans:wght@400;500;600&family=Newsreader:opsz,wght@6..72,500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="css/style.css">
+  <link rel="alternate" type="application/atom+xml" title="Sam Rose" href="feed.xml">
+</head>
+<body>
+<div class="page">
+
+  <header class="masthead">
+    <a class="name" href="index.html">Sam Rose</a>
+    <nav>
+      <a href="https://github.com/samrose">GitHub</a>
+      <a href="about.html">About</a>
+    </nav>
+  </header>
+
+  <main>
+    <p class="lede">
+      I have a decades long career keeping fleets of services, databases, and infrastructure alive.
+      In these notes, I cover doing the same for real, production LLM inference infrastructure: an overview of what it takes to build, deploy,
+      test, and maintain a serving platform that other teams and organizations can rely on.
+    </p>
+
+    <h2 id="series">Building an LLM inference platform</h2>
+    <p>
+      A series that builds a self-hosted inference platform on Kubernetes one
+      step at a time, with the code in a public repo alongside each post.
+      Each part ends at a point you can reproduce.
+    </p>
+
+    <ol class="series">
+      <li>
+        <span class="title"><a href="posts/part-1.html">A local tier you can trust before you touch a GPU</a></span>
+        <span class="summary">Pinned tooling, a disposable cluster, and a mock engine that behaves like vLLM at the edges. September 2026.</span>
+      </li>
+      <li class="unpublished">
+        <span class="title">The chart an app team actually uses</span>
+        <span class="summary">A values file in, a working endpoint out. Probes, rollouts under load, and tests that run without a cluster.</span>
+      </li>
+      <li class="unpublished">
+        <span class="title">Watching it, then scaling it</span>
+        <span class="summary">Prometheus, the metrics that matter for inference, and autoscaling on queue depth instead of CPU.</span>
+      </li>
+      <li class="unpublished">
+        <span class="title">The same thing in the cloud</span>
+        <span class="summary">Argo CD, OpenTofu, and a GPU node that the chart deploys to unchanged.</span>
+      </li>
+      <li class="unpublished">
+        <span class="title">Real numbers</span>
+        <span class="summary">vLLM on rented hardware, benchmarks you can rerun, and the SLOs and thresholds that fall out of them.</span>
+      </li>
+    </ol>
+
+    <p>
+      The code is at
+      <a href="https://github.com/samrose/inference-platform">github.com/samrose/inference-platform</a>.
+      Decisions are recorded in the repo's <code>docs/adr/</code> directory as
+      they're made.
+    </p>
+  </main>
+
+  <footer>
+    <p>Written by hand. <a href="feed.xml">RSS</a></p>
+  </footer>
+
+</div>
+</body>
+</html>
