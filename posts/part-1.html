@@ -65,7 +65,7 @@
         OpenTofu, argocd, just, python, uv etc). I pin them with a Nix flake
         and <code>flake.lock</code> is committed, so bumping a tool is a
         reviewable diff
-        (<a href="https://github.com/samrose/inference-platform/blob/main/docs/adr/001-tooling-pins-via-nixflake.md">ADR 0001</a>).
+        (<a href="https://github.com/samrose/inference-platform/blob/main/docs/adr/0001-tooling-pins-via-nixflake.md">ADR 0001</a>).
         Nix is only used for tooling here. Images are built with Docker and
         charts with Helm. If you don't want Nix, install the versions below
         some other way. Docker is the one thing the flake doesn't provide (I
