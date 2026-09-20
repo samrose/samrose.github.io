@@ -506,9 +506,8 @@ vllm:request_success_total{engine="0",finished_reason="length",model_name="mock/
 
       <h2>What this mock engine can't tell you</h2>
       <p>
-        The mock doesn't batch, doesn't model latency under load, and doesn't
-        tokenize. Time to first token and time per output token are
-        environment variables and a sleep. No performance conclusions can
+        The mock set up doesn't batch, it doesn't model latency under load, and it doesn't
+        tokenize. The time to first token and time per output token aren't measured; they're whatever numbers I set in environment variables, and the mock just sleeps for that duration. No performance conclusions can
         come from it. Benchmarks come later, from the real engine on real
         hardware.
       </p>
