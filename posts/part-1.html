@@ -49,7 +49,7 @@
         Most of an LLM inference infrastructure platform can be built and tested on a laptop
         without a GPU. The chart, probes, metrics scraping, dashboards, alerts
         and autoscaling only depend on how the engine behaves at its edges:
-        the port, what the health endpoint returns while weights load, and
+        the network port it listens on, what the health endpoint returns while weights load, and
         what the metrics are called. This post covers setting up a local tier with a
         stand-in engine that gets those right.
       </p>
