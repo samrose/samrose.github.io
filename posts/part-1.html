@@ -434,16 +434,18 @@ fi</code></pre>
         (<a href="https://github.com/samrose/inference-platform/blob/main/docs/adr/0004-mock-engine-scope.md">ADR 0004</a>).
       </p>
       <p>
-        I considered vLLM on CPU with a small model. It's slow to iterate on,
-        the metrics differ from the production build, and I can't control the
-        scaling signals. To test autoscaling on queue depth I need to set the
+        I considered vLLM on CPU with a small model. The mock starts in under a second and answers in milliseconds, so the feedback loop is instant. It emits a deliberately chosen subset of vLLM's metrics, with the same names, labels, and buckets, so every query written against it works unchanged in production. 
+        To test autoscaling on queue depth I need to set the
         queue to 12 and see what happens. So the mock has <code>POST
         /admin/state</code>, which sets queue depth and KV cache usage.
-        <code>num_requests_running</code> is real and follows requests in
-        flight.
+        Unlike queue depth and cache usage, which the admin endpoint fakes, 
+        the <code>num_requests_running</code> gauge is genuinely counted: 
+        it goes up when a request arrives and down when the response finishes. 
+        So concurrent requests to the mock show up in that metric the same way 
+        they would on a real engine.
       </p>
       <p>
-        One detail: <code>prometheus_client</code> adds a
+        One detail worth noting: <code>prometheus_client</code> adds a
         <code>_created</code> series for every counter and histogram by
         default, and vLLM's output doesn't have them. The Dockerfile sets
         <code>PROMETHEUS_DISABLE_CREATED_SERIES=true</code> so that the mock's
@@ -502,7 +504,7 @@ vllm:request_success_total{engine="0",finished_reason="length",model_name="mock/
         during it. The chart in part 2 fixes that.
       </p>
 
-      <h2>What this tier can't tell you</h2>
+      <h2>What this mock engine can't tell you</h2>
       <p>
         The mock doesn't batch, doesn't model latency under load, and doesn't
         tokenize. Time to first token and time per output token are
