@@ -29,44 +29,39 @@
         Code: <a href="https://github.com/samrose/inference-platform/tree/post-1">tag <code>post-1</code></a>.</p>
 
       <div class="series-note">
-        This series builds a self-hosted LLM serving platform on Kubernetes in
-        five parts, with the repo updated alongside each one. This part sets up
+        I created this series to document the process of building a self-hosted LLM serving platform on Kubernetes. The series is
+        five parts, with the repo updated alongside each one. This first part sets up
         the foundation: the tooling, a local cluster, and a stand-in for the
         inference engine.
       </div>
 
       <p>
-        Most guides to self-hosting an LLM end at <code>vllm serve</code>. That
-        gets you a process on port 8000 that answers a curl. It doesn't cover
-        how it gets deployed, how you know it is healthy, what happens to
-        in-flight requests during a rollout, or when to add a replica, and in
-        my experience that is most of the work.
+        This series' goal is not just being a guide or blog post. My aim is to provide a very comprehensive, reproducible approach to building a production-ready LLM inference platform.
       </p>
       <p>
-        This series builds that part. It's for people who already run
-        Kubernetes and are being asked to run inference. The code is at
+        The code is at
         <a href="https://github.com/samrose/inference-platform">github.com/samrose/inference-platform</a>, and each
         post has a tag.
       </p>
 
-      <h2>What this part claims</h2>
+      <h2>What this part covers</h2>
       <p>
-        Most of an inference platform can be built and tested on a laptop
+        Most of an LLM inference infrastructure platform can be built and tested on a laptop
         without a GPU. The chart, probes, metrics scraping, dashboards, alerts
         and autoscaling only depend on how the engine behaves at its edges:
         the port, what the health endpoint returns while weights load, and
-        what the metrics are called. This part sets up a local tier with a
+        what the metrics are called. This post covers setting up a local tier with a
         stand-in engine that gets those right.
       </p>
 
       <h2>Pinned tooling</h2>
       <p>
-        The repo needs about a dozen CLIs (kubectl, helm, kind, kubeconform,
-        OpenTofu, argocd, just, python, uv etc). I pin them with a Nix flake
-        and <code>flake.lock</code> is committed, so bumping a tool is a
+        The repo I created for this inference platform needs about a dozen CLIs (kubectl, helm, kind, kubeconform,
+        OpenTofu, argocd, just, python, uv etc). I pin them with a Nix flake for local development, and later for continuous integration. 
+        The flake provides reproducible versions for both environments, and the <code>flake.lock</code> is committed. So bumping a version of one of these tools is a
         reviewable diff
         (<a href="https://github.com/samrose/inference-platform/blob/main/docs/adr/0001-tooling-pins-via-nixflake.md">ADR 0001</a>).
-        Nix is only used for tooling here. Images are built with Docker and
+        Nix is only used for tooling here. The production OCI images are built with Docker and
         charts with Helm. If you don't want Nix, install the versions below
         some other way. Docker is the one thing the flake doesn't provide (I
         use OrbStack on a Mac).
@@ -81,24 +76,26 @@ inference-platform dev shell
   argocd   refs/tags/v3.4.6</code></pre>
 
       <p>
-        OpenTofu rather than Terraform because of the 2023 license change,
+        I selected OpenTofu rather than Terraform because of the 2023 license change,
         since this is a public repo
         (<a href="https://github.com/samrose/inference-platform/blob/main/docs/adr/0002-opentofu-over-terraform.md">ADR 0002</a>).
-        Helm 4 and kind 0.32 because Helm 3 is end of life in 2027 and this
+        Helm 4 and kind 0.32 were chosen because Helm 3 reaches end of life in 2027 and this
         is a new repo.
       </p>
-      <p>
-        kubectl is v1.37.0 and the cluster below is v1.36.1, because nixpkgs
-        unstable is ahead of the kind node image. kubectl supports one minor
-        version of skew so this is fine. The dev shell prints versions on
+        kubectl is v1.37.0 and the cluster below is v1.36.1. They're pinned in
+        different files on
+        purpose. The gap is within Kubernetes'
+        <a href="https://kubernetes.io/releases/version-skew-policy/">version skew policy</a>,
+        which supports a kubectl one minor version either side of the API server.
+        Making them match would add a flake override to maintain and gain nothing. The dev shell prints versions on
         entry so that this kind of skew is visible.
       </p>
 
       <h2>A disposable cluster from one command</h2>
       <p>
         Every local operation is a recipe in the <code>justfile</code>
-        (<a href="https://just.systems">just</a> is a command runner).
-        <code>KUBECONFIG</code> is set to <code>local/kubeconfig</code> in
+        (<a href="https://just.systems">just</a> is a command runner if you are not familiar with it).
+        The <code>KUBECONFIG</code> is set to <code>local/kubeconfig</code> in
         both the justfile and the dev shell, so nothing here can touch a
         cluster in <code>~/.kube/config</code>.
       </p>
@@ -106,19 +103,18 @@ inference-platform dev shell
         <code>just up</code> creates a 3 node kind cluster (one control plane
         and two workers, so that scheduling across nodes and drains can be
         tested later), with the node image pinned by digest from the kind
-        v0.32.0 release notes. It also starts a <code>registry:2</code>
-        container on <code>127.0.0.1:5001</code>, connects it to the
-        <code>kind</code> Docker network, and configures containerd on each
-        node to pull <code>localhost:5001</code> images from it. I went with
-        a registry over <code>kind load docker-image</code> so that the local
-        workflow is build, push, reference by digest, which is the same as it
+        v0.32.0 release notes. This command also starts a <code>registry:2</code>
+        container on <code>127.0.0.1:5001</code>, and connects it to the
+        <code>kind</code> Docker network + configures containerd on each
+        node to pull <code>localhost:5001</code> images from it. I decided to run a local registry over <code>kind load docker-image</code> so that the local
+        workflow is build, push, reference by digest. The benefit is that the workflow will be the same as it
         will be in the cloud
         (<a href="https://github.com/samrose/inference-platform/blob/main/docs/adr/0003-local-registry-with-kind.md">ADR 0003</a>).
       </p>
       <p>
         <code>just down</code> removes the cluster and keeps the registry,
         <code>just nuke</code> removes both. <code>just up</code> takes about
-        a minute and is safe to run again:
+        a minute and is safe to run repeatedly:
       </p>
 
       <!-- CHECK: real output, but from a second run against an existing cluster. -->
@@ -342,8 +338,9 @@ nodes:
     image: kindest/node:v1.36.1@sha256:3489c7674813ba5d8b1a9977baea8a6e553784dab7b84759d1014dbd78f7ebd5</code></pre>
       </details>
 
-      <h2>The first bug</h2>
+      <h2>The first bug encountered</h2>
       <p>
+        The first bug I encountered writing this devenvwas related to how <code>just</code> handles its own variables.
         just uses <code>{{ }}</code> for its own variables, and so does
         <code>docker inspect --format</code>. To pass a literal
         <code>{{</code> through just you write <code>{{{{</code>, and the
@@ -365,12 +362,12 @@ fi</code></pre>
       </p>
       <!-- CHECK: the --platform detail is inferred from the comment above the smoke recipe. -->
       <p>
-        <code>just smoke</code> then timed out. At that point it was a
-        <code>kubectl run --rm -i</code>, so a timeout was all I had to go on.
-        I'm on Apple Silicon, so I assumed an architecture mismatch, and there
-        was one: the smoke recipe pulled busybox with an explicit
-        <code>--platform</code>. I removed that and it still timed out.
-      </p>
+  <code>just smoke</code> then timed out. The recipe used
+  <code>kubectl run --rm -i</code>, which reports a bare timeout when a pod
+  never starts and deletes the pod afterwards, so there was nothing to
+  inspect. A wrong image, wrong architecture, or unreachable registry would all
+  have looked identical.
+</p>
       <p>
         The pod events had the answer. This is what they look like with the
         registry disconnected from the kind network:
@@ -393,8 +390,8 @@ Events:
       <pre class="wrap"><code>failed to do request: Head "http://kind-registry:5000/v2/busybox/manifests/repro-1789847397?ns=%5BREDACTED%5D": dial tcp: lookup kind-registry on 0.250.250.254:53: no such host</code></pre>
 
       <p>
-        The node can't resolve the registry container by name, so it's the
-        Docker network and not architecture.
+        The pod events showed the pull failing because the node couldn't resolve
+  <code>kind-registry</code> by name.
       </p>
       <p>
         The fix was removing two characters. I also changed
@@ -410,9 +407,9 @@ Events:
 fi</code></pre>
 
       <p>
-        A timeout told me something was wrong but not what. I want failing
-        checks in this repo to say why, and the same will apply to probes and
-        alerts later.
+        A timeout told me something was wrong but not what. We really need failing
+        checks in this repo to say why, and the same consideration will apply to probes and
+        alerts later on in this series and platform I create.
       </p>
 
       <h2>A mock engine</h2>
@@ -523,7 +520,7 @@ vllm:request_success_total{engine="0",finished_reason="length",model_name="mock/
 
       <h2>Next</h2>
       <p>
-        Part 2 is the Helm chart: the values file an app team uses, startup
+        In Part 2 we will provide the Helm chart to hold the values file an app team will use to put a model into service onto Kubernetes. In addition we'll include startup
         probe timing, chart tests that run without a cluster, and a rolling
         update under load.
       </p>
@@ -531,7 +528,7 @@ vllm:request_success_total{engine="0",finished_reason="length",model_name="mock/
 
     <nav class="prev-next">
       <span></span>
-      <span>Part 2: The chart an app team actually uses (not yet published)</span>
+      <span>Part 2: The Helm chart an app team will actually use (not yet published)</span>
     </nav>
   </main>
 
