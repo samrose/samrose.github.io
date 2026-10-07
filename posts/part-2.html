@@ -1,0 +1,735 @@
+<!doctype html>
+<html lang="en">
+
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>A real interface into inference infrastructure for app teams — Sam Rose</title>
+  <meta name="description"
+    content="Part 2 of building an LLM inference platform: a Helm chart with a digest-only image, probes sized for weight loading, and rollouts and drains verified under load.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link
+    href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono&family=IBM+Plex+Sans:wght@400;500;600&family=Newsreader:opsz,wght@6..72,500&display=swap"
+    rel="stylesheet">
+  <link rel="stylesheet" href="../css/style.css">
+  <link rel="canonical" href="https://samrose.github.io/posts/part-2.html">
+</head>
+
+<body>
+  <div class="page">
+
+    <header class="masthead">
+      <a class="name" href="../">Sam Rose</a>
+      <nav>
+        <a href="https://github.com/samrose">GitHub</a>
+        <a href="../about.html">About</a>
+      </nav>
+    </header>
+
+    <main>
+      <article>
+        <h1>A real interface into inference infrastructure for app teams</h1>
+        <!-- CHECK: tag post-2 does not exist yet. The part 2 work is on branch part-2-load-tests. -->
+        <p class="meta">September 2026. Part 2 of <a href="../#series">Building an LLM inference platform</a>.
+          Code: <a href="https://github.com/samrose/inference-platform/tree/post-2">tag <code>post-2</code></a>.</p>
+
+        <div class="series-note">
+          Part 1 set up pinned tooling, a disposable kind cluster and a mock
+          engine that behaves like vLLM at its edges. This part adds the Helm
+          chart that puts a model into service, and the tests that show it
+          behaves the way the chart says it does.
+        </div>
+
+        <h2>What this part covers</h2>
+        <p>
+          The people who want a model served usually don't want to learn how
+          the engine underneath it is run, and I don't think they should have
+          to. Their interface into the system is a Helm chart: they fill in a short
+          values file (which image, which model, how long it takes to load) and
+          the chart turns that into a running service. This post goes through
+          what is in that values file and why, the health checks, and how I set up rolling updates and
+          node drains so that in-flight requests finish instead of being cut
+          off. There are two kinds of test for all of this, unit tests for the
+          templates that run in a second with no k8s cluster, and load tests that
+          run inside of a cluster. I also added CI along the way
+          (<a href="https://github.com/samrose/inference-platform/blob/main/docs/adr/0006-ci-from-the-flake.md">ADR
+            0006</a>).
+          It runs the same <code>just check</code> recipe I run on my laptop,
+          using the same Nix flake, so the tool versions are pinned in one place
+          and nowhere else.
+        </p>
+
+        <h2>The values interface</h2>
+        <p>
+          <code>charts/inference-service</code> deploys one model per Helm
+          release
+          (<a
+            href="https://github.com/samrose/inference-platform/blob/main/docs/adr/0007-chart-interface-and-rollout-safety.md">ADR
+            0007</a>),
+          so if I want to serve three models I install the chart three times,
+          each with its own values file. I originally looked at two other ways of doing
+          it. The first was one chart that takes a list of models, but then
+          all of the models go out in the same release, and one bad model
+          holds up the rest of them. The second was to write an operator (a
+          controller that runs in the cluster and watches a <code>Model</code>
+          custom resource), which is a lot more to build and run than I need
+          for this series.
+
+          An operator makes sense when something has to react to what's happening in the cluster, like scaling a model
+          to zero when nobody's using it. My models are just config that doesn't change until I commit a new values
+          file, and Argo CD already applies whatever is in Git, so an operator wouldn't have anything to do..
+          In this example with the architecture I've chosen, having lots of small releases, each with its own
+          values file, is also just the kind of thing Argo CD is good at
+          managing. I'll write about this more in part 4.
+        </p>
+        <p>
+          The values file has two required fields,
+          <code>image.repository</code> and <code>image.digest</code> (the
+          sha256 hash of the image contents). <code>image.tag</code> is
+          refused, because a tag can be moved to point at a different image
+          later and a digest can't, so what gets deployed is always the exact
+          image that was tested. <code>model.name</code>,
+          <code>engine.args</code> and <code>engine.env</code> say what the
+          engine is and how it starts. Those are the only values that are
+          different between the mock and vLLM, and the templates don't have
+          any mock-specific branches in them. Locally
+          <code>just deploy</code> runs this:
+        </p>
+
+        <pre><code>helm upgrade --install "mock" "charts/inference-service" \
+    --set image.repository="localhost:5001/mock-engine" \
+    --set image.digest="$(cat local/mock-engine.digest)" \
+    --set-string engine.env.STARTUP_DELAY_SECONDS=15 \
+    --wait --timeout 3m</code></pre>
+
+        <p>
+          The chart checks the values at install time, in two places. Most of
+          it is done by <code>values.schema.json</code> (a JSON Schema file
+          that Helm validates the values against before it renders anything).
+          The image helper in <code>_helpers.tpl</code> covers what the schema
+          can't say clearly, and fails with its own message, like the first
+          error here. This is what it looks like when values are rejected:
+        </p>
+
+        <pre><code>$ helm template t charts/inference-service --set image.repository=x
+Error: execution error at (inference-service/templates/deployment.yaml:37:20): image.digest is required (sha256:...)
+
+$ helm template t charts/inference-service -f ci/lint-values.yaml --set image.tag=dev
+Error: values don't meet the specifications of the schema(s) in the following chart(s):
+inference-service:
+- at '/image': additional properties 'tag' not allowed
+
+$ helm template t charts/inference-service --set image.repository=x --set image.digest=abc123
+Error: values don't meet the specifications of the schema(s) in the following chart(s):
+inference-service:
+- at '/image/digest': 'abc123' does not match pattern '^(|sha256:[0-9a-f]{64})$'</code></pre>
+
+        <details>
+          <summary>charts/inference-service/values.yaml</summary>
+          <pre><code># values.yaml — the interface an app team sees.
+#
+# Required: image.repository, image.digest. Everything else has a default that
+# is right for the mock engine and reasonable for a small real model.
+
+model:
+  # Model id the engine reports from /v1/models and uses in metric labels.
+  name: mock/mock-8b
+
+image:
+  # e.g. localhost:5001/mock-engine locally, or a registry path in the cloud.
+  repository: ""
+  # sha256:... — required. Tags are refused so a deploy is always reproducible.
+  digest: ""
+  pullPolicy: IfNotPresent
+
+replicaCount: 1
+
+engine:
+  # Port the engine listens on. vLLM and the mock both default to 8000.
+  port: 8000
+  # Extra args for the engine command, e.g. ["--model", "meta-llama/..."] for vLLM.
+  # The mock needs none.
+  args: []
+  # Extra environment for the engine container. MODEL_NAME is always set from model.name.
+  env: {}
+  # How long the engine is allowed to take to load weights before the pod is
+  # restarted. Sets the startup probe: failureThreshold = ceil(loadTimeoutSeconds / probes.periodSeconds).
+  loadTimeoutSeconds: 600
+
+probes:
+  # Shared by the startup, readiness and liveness probes.
+  path: /health
+  periodSeconds: 5
+  timeoutSeconds: 2
+  # Consecutive failures before a Ready pod is pulled from the Service.
+  readinessFailureThreshold: 3
+  # Consecutive failures before a started pod is restarted. Generous: a busy
+  # engine can be slow to answer /health and a restart drops every request.
+  livenessFailureThreshold: 6
+
+rollout:
+  # Never take a serving pod away before its replacement is Ready.
+  maxSurge: 1
+  # Seconds to keep serving after SIGTERM is scheduled, so in-flight streams
+  # finish and endpoints propagate the removal before the process is stopped.
+  preStopSeconds: 10
+  # Must exceed preStopSeconds plus the longest response you expect to drain.
+  terminationGracePeriodSeconds: 90
+
+service:
+  type: ClusterIP
+  port: 8000
+
+metrics:
+  # Adds prometheus.io/* pod annotations. Part 3 adds a ServiceMonitor.
+  annotations: true
+
+# Only rendered when replicaCount &gt; 1: keeps at least one pod through node drains.
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+
+# e.g. limits: {nvidia.com/gpu: 1}, requests: {cpu: "4", memory: 16Gi}
+resources: {}
+
+podAnnotations: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}</code></pre>
+        </details>
+
+        <h2>Probes sized for weight loading</h2>
+        <p>
+          In part 1 I ran the mock with <code>kubectl run</code> and no probes
+          (the health checks Kubernetes makes against a container), so the pod
+          was marked Ready straight away, and it answered 503 four times
+          before the engine was actually up. With a real engine that gap is as
+          long as the weights take to load, and any traffic sent to the pod in
+          that time fails.
+        </p>
+        <p>
+          The chart covers that gap with a startup probe, which is a check
+          that has to pass once before Kubernetes treats the container as
+          started. <code>engine.loadTimeoutSeconds</code> (default 600) is how
+          long the engine is allowed to take to load. The chart divides it by
+          <code>probes.periodSeconds</code> and rounds up to get the startup
+          probe's <code>failureThreshold</code>, so with the defaults that is
+          600 / 5 = 120 attempts. The readiness probe (which decides if the
+          pod gets traffic) and the liveness probe (which decides if the
+          container gets restarted) don't run until the startup probe has
+          passed once. I set the liveness threshold to 6 failed checks in a
+          row, which is generous on purpose, since restarting a loaded engine
+          drops every request it is holding. This is what renders with the
+          defaults:
+        </p>
+
+        <pre><code>          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 120
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 6
+          lifecycle:
+            preStop:
+              sleep:
+                seconds: 10</code></pre>
+
+        <p>
+          Docker had been stopped overnight, and when I started it again the
+          mock pod restarted with it. The pod showed <code>0/1 Running</code>
+          (running but not Ready, so it gets no traffic) for the 15 seconds of
+          startup delay that <code>just deploy</code> sets, and the events
+          show the startup probe getting a 503 in that time:
+        </p>
+
+        <pre><code>$ kubectl get pods
+NAME                                      READY   STATUS    RESTARTS      AGE
+mock-inference-service-596f4dfc4b-495rj   0/1     Running   1 (15s ago)   17h
+
+$ kubectl get events --field-selector involvedObject.name=mock-inference-service-596f4dfc4b-495rj
+LAST SEEN   TYPE      REASON           OBJECT                                        MESSAGE
+23s         Normal    SandboxChanged   pod/mock-inference-service-596f4dfc4b-495rj   Pod sandbox changed, it will be killed and re-created.
+22s         Normal    Started          pod/mock-inference-service-596f4dfc4b-495rj   Container started
+8s          Warning   Unhealthy        pod/mock-inference-service-596f4dfc4b-495rj   Startup probe failed: HTTP probe failed with statuscode: 503</code></pre>
+
+        <h2>Rollouts that keep streams alive</h2>
+        <p>
+          A streamed response can run for a long time, and if a rollout stops
+          a pod as soon as its replacement is Ready, any stream that pod was
+          in the middle of gets cut off. The chart handles this in two ways.
+          The Deployment uses <code>maxUnavailable: 0</code> and
+          <code>maxSurge: 1</code>, which means a rollout adds one new pod at
+          a time, and a serving pod is only removed after its replacement has
+          passed its probes. Then when a pod is removed, it first gets a
+          <code>preStop</code> hook (something Kubernetes runs in the
+          container before it sends SIGTERM) that sleeps for 10 seconds. The
+          pod keeps serving during the sleep, which gives the endpoints
+          controller time to take it out of the Service so that no new
+          requests are sent to it. After that it has what is left of the 90
+          second termination grace period (the 90 seconds includes the sleep)
+          to finish the streams it still has open. For the sleep I used the
+          <code>sleep</code> lifecycle action that is built into Kubernetes,
+          instead of an <code>exec</code> that runs a sleep command inside the
+          image. That needs Kubernetes 1.30, which is why
+          <code>Chart.yaml</code> says <code>kubeVersion: "&gt;=1.30.0-0"</code>.
+        </p>
+        <p>
+          When <code>replicaCount</code> is more than 1, the chart also
+          renders a PodDisruptionBudget with <code>minAvailable: 1</code>.
+          That is a rule that tells Kubernetes how many pods of the release
+          have to stay up during a voluntary disruption like a node drain
+          (emptying a node of its pods, usually before maintenance), so a
+          drain has to wait for a replacement before it can evict the last
+          serving pod. The unit test for it has two cases. With one replica
+          no PodDisruptionBudget is rendered, and with three replicas one is
+          rendered with <code>minAvailable: 1</code>.
+        </p>
+
+        <h2>Tests that run without a cluster</h2>
+        <p>
+          <code>just test</code> runs
+          <a href="https://github.com/helm-unittest/helm-unittest">helm unittest</a>
+          (a Helm plugin that renders the templates with given values and
+          asserts on the YAML that comes out) against the chart.
+          <code>just lint</code> runs <code>helm lint</code>, and then renders
+          the chart and pipes it through kubeconform, which checks each
+          manifest against the Kubernetes API schemas for a given version.
+          That version is read from the pinned kind node image in
+          <code>local/kind-config.yml</code>. I did it that way instead of
+          asking a running cluster so that my laptop and CI agree on it (CI
+          has no cluster to ask).
+        </p>
+
+        <pre><code>$ just test
+helm unittest "charts/inference-service"
+
+### Chart [ inference-service ] charts/inference-service
+
+ PASS  deployment	charts/inference-service/tests/deployment_test.yaml
+ PASS  pod disruption budget	charts/inference-service/tests/pdb_test.yaml
+
+Charts:      1 passed, 1 total
+Test Suites: 2 passed, 2 total
+Tests:       14 passed, 14 total
+Snapshot:    0 passed, 0 total
+Time:        14.627959ms
+
+$ just lint
+helm lint "charts/inference-service" -f "charts/inference-service/ci/lint-values.yaml"
+==> Linting charts/inference-service
+[INFO] Chart.yaml: icon is recommended
+
+1 chart(s) linted, 0 chart(s) failed
+helm template test "charts/inference-service" -f "charts/inference-service/ci/lint-values.yaml" | kubeconform -strict -summary -kubernetes-version "$(just _k8s-version)"
+Summary: 3 resources found parsing stdin - Valid: 3, Invalid: 0, Errors: 0, Skipped: 0</code></pre>
+
+        <p>
+          Each test is short, and its name says what the chart is promising.
+          These are two of them:
+        </p>
+
+        <pre><code>  - it: rounds the startup probe up, never down
+    set:
+      engine.loadTimeoutSeconds: 61
+      probes.periodSeconds: 10
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].startupProbe.failureThreshold
+          value: 7
+
+  - it: never removes a serving pod before its replacement is ready
+    asserts:
+      - equal:
+          path: spec.strategy.rollingUpdate.maxUnavailable
+          value: 0
+      - equal:
+          path: spec.strategy.rollingUpdate.maxSurge
+          value: 1</code></pre>
+
+        <p>
+          CI is two GitHub Actions jobs. The first installs Nix and runs
+          <code>nix develop .#ci -c just check</code>, which runs the
+          formatters in check mode (they report a file that needs formatting
+          and don't change it), the linters, and the chart checks above. The
+          second builds the mock image with Docker, starts it, and checks that
+          <code>/health</code> gets to 200 and that <code>/metrics</code> has
+          the vLLM series names in it. Neither job runs a cluster. There is
+          also <code>just hooks</code>, which installs a git pre-commit hook
+          that runs the linters on just the files that are staged. I wrote it
+          with plain git and just instead of using the pre-commit framework,
+          because the framework would be a second place that pins tool
+          versions, and I want those pinned in the flake only.
+        </p>
+
+        <h2>A rollout under load</h2>
+        <p>
+          The unit tests show that the manifests say the right thing, but
+          they can't show that Kubernetes does the right thing with them. For
+          that I need traffic running while pods are being replaced, and a
+          count of what happened to every request
+          (<a
+            href="https://github.com/samrose/inference-platform/blob/main/docs/adr/0008-rollout-and-drain-verified-under-load.md">ADR
+            0008</a>).
+        </p>
+        <p>
+          <code>loadtest/load.py</code> does that. It runs as a pod inside the
+          cluster and sends its requests to the release's Service name. It
+          runs four loops of streaming chat completions for a fixed length of
+          time, and counts every request by how it ended:
+          <code>ok</code> if the stream got to <code>[DONE]</code>,
+          <code>truncated</code> if it ended early,
+          <code>http_&lt;code&gt;</code> for an error status, or the name of
+          the exception class if the connection failed. If it counted anything
+          other than <code>ok</code> it exits with a failure mode of 1. It only uses the Python
+          standard library, so it can run in the mock engine's image, which is
+          already in the registry and has Python in it, and I didn't have to
+          pin another image.
+        </p>
+        <p>
+          The first thing I tried was running the load from my laptop through
+          <code>kubectl port-forward</code>. That doesn't work for this,
+          because port-forward picks one pod when it connects and stays on
+          that pod, it doesn't follow the Service through a rollout. So it
+          reports failures that a client going through the Service would never
+          have seen.
+        </p>
+        <p>
+          <code>just rollout-test</code> starts the load pod, waits 20
+          seconds, then does a <code>helm upgrade</code> with a changed env
+          value so that every pod gets replaced. It waits for the rollout to
+          finish and prints the counts:
+        </p>
+
+        <pre><code>$ just rollout-test
+pod/load created
+--- helm upgrade: a changed env value forces every pod to be replaced
+Waiting for deployment "mock-inference-service" rollout to finish: 1 old replicas are pending termination...
+Waiting for deployment "mock-inference-service" rollout to finish: 1 old replicas are pending termination...
+deployment "mock-inference-service" successfully rolled out
+load: 4 streams against http://mock-inference-service:8000/v1/chat/completions for 150s
+t=   5s total=   28 {'ok': 28}
+t=  10s total=   60 {'ok': 60}
+t=  15s total=   92 {'ok': 92}
+[t=20s through t=145s omitted, all ok]
+t= 150s total=  928 {'ok': 928}
+t= 155s total=  932 {'ok': 932}
+final total=932 ok=932 failures=none</code></pre>
+
+        <p>
+          Zero failures only means something if the test is able to fail, so
+          I ran it again with the drain settings turned off
+          (<code>rollout.preStopSeconds=0</code> and
+          <code>rollout.terminationGracePeriodSeconds=1</code>):
+        </p>
+
+        <!-- CHECK: the "30 seconds" reading of the rate dip is inferred from urlopen's timeout=30 in load.py, not observed directly. -->
+        <pre><code>$ just rollout-test
+[...]
+t=  40s total=  245 {'ok': 245}
+t=  45s total=  274 {'ok': 266, 'URLError': 8}
+t=  50s total=  290 {'ok': 282, 'URLError': 8}
+t=  55s total=  306 {'ok': 298, 'URLError': 8}
+t=  60s total=  322 {'ok': 314, 'URLError': 8}
+t=  65s total=  338 {'ok': 330, 'URLError': 8}
+t=  70s total=  352 {'ok': 344, 'URLError': 8}
+t=  75s total=  380 {'ok': 370, 'URLError': 10}
+t=  80s total=  412 {'ok': 402, 'URLError': 10}
+[...]
+final total=848 ok=838 failures={'URLError': 10}
+error: recipe `_load-result` failed with exit code 1
+error: recipe `rollout-test` failed with exit code 1</code></pre>
+
+        <p>
+          This time 10 connections failed in the seconds after the old pod
+          went away. The request rate also dropped by about half for around 30
+          seconds, while two of the four loops sat waiting in the client's
+          connect timeout. The first time I ran this control it counted 2
+          failures out of 925, so the number moves around, but it has never
+          been zero.
+        </p>
+
+        <h2>A drain under load</h2>
+        <p>
+          <code>just drain-test</code> scales the release to 2 replicas, and
+          starts the load pod pinned to the worker node that the first pod
+          isn't on, so the drain doesn't evict the load pod as well. Then it
+          drains the node the first pod is on, and uncordons it afterwards
+          (which lets pods be scheduled on it again):
+        </p>
+
+        <pre><code>$ just drain-test
+--- before
+NAME                                     READY   STATUS    RESTARTS   AGE   IP           NODE                NOMINATED NODE   READINESS GATES
+mock-inference-service-64978cb57-b7zmt   1/1     Running   0          20s   10.244.1.6   inference-worker    &lt;none&gt;           &lt;none&gt;
+mock-inference-service-64978cb57-jkjqw   1/1     Running   0          53s   10.244.2.4   inference-worker2   &lt;none&gt;           &lt;none&gt;
+pod/load created
+--- kubectl drain inference-worker
+node/inference-worker cordoned
+Warning: ignoring DaemonSet-managed Pods: kube-system/kindnet-2kzq6, kube-system/kube-proxy-6xshk
+evicting pod default/mock-inference-service-64978cb57-b7zmt
+pod/mock-inference-service-64978cb57-b7zmt evicted
+node/inference-worker drained
+--- after
+NAME                                     READY   STATUS    RESTARTS   AGE   IP           NODE                NOMINATED NODE   READINESS GATES
+mock-inference-service-64978cb57-jkjqw   1/1     Running   0          86s   10.244.2.4   inference-worker2   &lt;none&gt;           &lt;none&gt;
+mock-inference-service-64978cb57-nccsb   0/1     Running   0          12s   10.244.2.6   inference-worker2   &lt;none&gt;           &lt;none&gt;
+NAME                     MIN AVAILABLE   MAX UNAVAILABLE   ALLOWED DISRUPTIONS   AGE
+mock-inference-service   1               N/A               0                     53s
+load: 4 streams against http://mock-inference-service:8000/v1/chat/completions for 150s
+t=   5s total=   28 {'ok': 28}
+[t=10s through t=150s omitted, all ok]
+t= 155s total=  944 {'ok': 944}
+final total=944 ok=944 failures=none</code></pre>
+
+        <p>
+          The <code>after</code> output shows the state just after the drain.
+          The replacement pod is <code>0/1</code>, as it is still in its
+          startup delay, and the budget shows
+          <code>ALLOWED DISRUPTIONS 0</code>, which means a second drain at
+          that moment would have had to wait. The one Ready pod served
+          everything in that time, and all 944 requests came back
+          <code>ok</code>.
+        </p>
+
+        <details>
+          <summary>loadtest/load.py</summary>
+          <pre><code>"""
+Streaming load generator. Runs as a pod inside the cluster, against a
+release's Service, so a rollout or a node drain that drops requests shows up
+as a number rather than a feeling.
+
+Every request is counted by outcome:
+  ok          stream reached data: [DONE]
+  truncated   HTTP 200 but the stream ended early (pod stopped mid-response)
+  http_&lt;code&gt; non-2xx response
+  &lt;ExcName&gt;   connection-level failure (refused, reset, timeout)
+
+Configured by environment:
+  TARGET              base URL, e.g. http://mock-inference-service:8000
+  DURATION_SECONDS    how long to run
+  CONCURRENCY         parallel request loops
+  MODEL_NAME          model id to send
+
+Stdlib only, so it runs unchanged in the mock engine's image. Each request
+opens a new connection, which is the simplest client and also the most
+forgiving one; a keep-alive client can see one reset per retired pod.
+"""
+
+import collections
+import json
+import os
+import sys
+import threading
+import time
+import urllib.error
+import urllib.request
+
+URL = os.environ.get("TARGET", "http://mock-inference-service:8000") + "/v1/chat/completions"
+DURATION = float(os.environ.get("DURATION_SECONDS", "120"))
+CONCURRENCY = int(os.environ.get("CONCURRENCY", "4"))
+MODEL = os.environ.get("MODEL_NAME", "mock/mock-8b")
+
+BODY = json.dumps(
+    {
+        "model": MODEL,
+        "stream": True,
+        "max_tokens": 20,
+        "messages": [{"role": "user", "content": "hi"}],
+    }
+).encode()
+
+counts: collections.Counter[str] = collections.Counter()
+lock = threading.Lock()
+started = time.monotonic()
+deadline = started + DURATION
+
+
+def one_request() -&gt; str:
+    req = urllib.request.Request(URL, data=BODY, headers={"content-type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            done = False
+            for line in resp:
+                if line.startswith(b"data: [DONE]"):
+                    done = True
+            return "ok" if done else "truncated"
+    except urllib.error.HTTPError as e:
+        return f"http_{e.code}"
+    except Exception as e:  # noqa: BLE001 - every failure kind is a count, not a crash
+        return type(e).__name__
+
+
+def worker() -&gt; None:
+    while time.monotonic() &lt; deadline:
+        outcome = one_request()
+        with lock:
+            counts[outcome] += 1
+
+
+threads = [threading.Thread(target=worker, daemon=True) for _ in range(CONCURRENCY)]
+for t in threads:
+    t.start()
+
+print(f"load: {CONCURRENCY} streams against {URL} for {int(DURATION)}s", flush=True)
+while any(t.is_alive() for t in threads):
+    time.sleep(5)
+    with lock:
+        snapshot = dict(counts)
+    print(
+        f"t={int(time.monotonic() - started):4d}s total={sum(snapshot.values()):5d} {snapshot}",
+        flush=True,
+    )
+
+with lock:
+    final = dict(counts)
+failures = {k: v for k, v in final.items() if k != "ok"}
+print(
+    f"final total={sum(final.values())} ok={final.get('ok', 0)} failures={failures or 'none'}",
+    flush=True,
+)
+sys.exit(1 if failures else 0)</code></pre>
+        </details>
+
+        <details>
+          <summary>justfile: load, rollout-test, drain-test</summary>
+          <pre><code># ---- load and resilience (part 2) ----------------------------------------------
+
+# run loadtest/load.py as a pod against a release's Service; pin it to a node with node=
+load release="mock" seconds="120" concurrency="4" node="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    img="{{ mock_image }}@$(cat local/mock-engine.digest)"
+    node="{{ node }}"
+    overrides='{}'
+    [ -z "$node" ] || overrides="{\"spec\":{\"nodeName\":\"$node\"}}"
+    kubectl delete pod load --ignore-not-found --wait &gt;/dev/null
+    kubectl run load --restart=Never --image="$img" --overrides="$overrides" \
+        --env TARGET="http://{{ release }}-inference-service:8000" \
+        --env DURATION_SECONDS="{{ seconds }}" --env CONCURRENCY="{{ concurrency }}" \
+        --command -- python -c "$(cat loadtest/load.py)"
+
+# wait for the load pod to finish and print its counts; exit 1 if any request failed
+_load-result:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # not `kubectl wait`: it never returns for a pod that ends in Failed
+    phase=""
+    for _ in $(seq 1 120); do
+        phase=$(kubectl get pod load -o jsonpath='{.status.phase}')
+        case "$phase" in Succeeded|Failed) break ;; esac
+        sleep 5
+    done
+    ok=0; [ "$phase" = Succeeded ] &amp;&amp; ok=1
+    kubectl logs load
+    kubectl delete pod load &gt;/dev/null
+    [ "$ok" = 1 ]
+
+# replace every pod of a release while load runs; the final line of the load log is the verdict
+rollout-test release="mock":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    just load "{{ release }}" 150 4
+    sleep 20
+    echo "--- helm upgrade: a changed env value forces every pod to be replaced"
+    helm upgrade "{{ release }}" "{{ chart }}" --reuse-values \
+        --set-string engine.env.ROLLOUT_MARKER="$(date +%s)" &gt;/dev/null
+    kubectl rollout status deploy/"{{ release }}-inference-service" --timeout=5m
+    just _load-result
+
+# drain the node running the release's first pod while 2 replicas serve under load
+drain-test release="mock":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    helm upgrade "{{ release }}" "{{ chart }}" --reuse-values --set replicaCount=2 \
+        --wait --timeout 3m &gt;/dev/null
+    sel="app.kubernetes.io/instance={{ release }}"
+    echo "--- before"
+    kubectl get pods -l "$sel" -o wide
+    node=$(kubectl get pods -l "$sel" -o jsonpath='{.items[0].spec.nodeName}')
+    other=$(kubectl get nodes -l '!node-role.kubernetes.io/control-plane' -o name | grep -vx "node/$node" | head -1 | cut -d/ -f2)
+    just load "{{ release }}" 150 4 "$other"
+    sleep 20
+    echo "--- kubectl drain $node"
+    kubectl drain "$node" --ignore-daemonsets --delete-emptydir-data --timeout=4m
+    echo "--- after"
+    kubectl get pods -l "$sel" -o wide
+    kubectl uncordon "$node" &gt;/dev/null
+    kubectl get pdb -l "$sel"
+    just _load-result</code></pre>
+        </details>
+
+        <h2>What these tests can't tell you</h2>
+        <p>
+          The load client opens a new connection for every request, which is
+          the most forgiving way a client can behave here. A keep-alive client
+          (one that reuses a connection across requests) can see one
+          connection reset for each pod that is retired, and I left measuring
+          that for the benchmark work. Latency isn't measured at all, since
+          the mock's timings are just numbers I set in environment variables.
+        </p>
+        <p>
+          The drain defaults are sized for the mock. I don't know yet if 90
+          seconds is enough for vLLM to finish a long streamed response, that
+          is a question for part 5, and the rollout test is there so that I
+          can answer it by running it instead of guessing. Both tests need a
+          cluster, so for now they only run on my laptop, until CI has a
+          cluster of its own.
+        </p>
+        <p>
+          The startup probe is also only half of the weight loading story.
+          It stops traffic reaching a pod that isn't ready, but it doesn't
+          make the pod ready any sooner, and with the mock there is nothing
+          to load, so <code>loadTimeoutSeconds</code> is a budget I have
+          never actually spent. With vLLM every new pod would download the
+          weights from Hugging Face before it can serve, which makes a
+          rollout take as long as the download and makes the pod depend on
+          a network it shouldn't need. The fix is to stage the weights
+          before the pod starts, on a volume that outlives the pod or in an
+          OCI image that is pulled by digest like the engine image is, so
+          that a model is pinned by revision and checksum the same way the
+          image is. That needs real weights to mean anything, so it goes in
+          part 5 with vLLM, and the chart will grow a
+          <code>model.source</code> value then.
+        </p>
+
+        <h2>Next</h2>
+        <p>
+          Part 3 adds Prometheus, the metrics that matter for inference, and
+          autoscaling on queue depth instead of CPU. The
+          <code>prometheus.io/*</code> annotations are already on the pods.
+          The ServiceMonitor (a custom resource that tells the Prometheus
+          operator what to scrape) can't be added until its CRD is installed
+          in the cluster, so it waits for part 3 as well.
+        </p>
+      </article>
+
+      <nav class="prev-next">
+        <a href="part-1.html">Part 1: Development environment bootstrapping</a>
+        <span>Part 3: Watching it, then scaling it (not yet published)</span>
+      </nav>
+    </main>
+
+    <footer>
+      <p>Written by Sam Rose. <a href="../feed.xml">RSS</a></p>
+    </footer>
+
+  </div>
+</body>
+
+</html>
